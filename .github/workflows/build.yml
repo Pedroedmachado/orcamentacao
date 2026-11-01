@@ -1,0 +1,212 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  android-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Nome do sistema
+        shell: bash
+        run: cat tool/app.env >> "$GITHUB_ENV"
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+      - name: Dependências do Linux
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y clang cmake ninja-build pkg-config libgtk-3-dev liblzma-dev libstdc++-12-dev poppler-utils fonts-dejavu-core
+      - name: Build
+        shell: bash
+        run: |
+          set -o pipefail
+          mkdir -p ci
+          status=0
+          {
+            echo "== flutter --version"; flutter --version
+            echo "== prepare"; bash tool/prepare_platforms.sh
+            echo "== pub get"; flutter pub get
+            echo "== analyze"; flutter analyze --no-fatal-infos --no-fatal-warnings || echo "ANALYZE_FAILED"
+            echo "== test"; flutter test --coverage || echo "TEST_FAILED"
+            echo "== cobertura"; bash tool/coverage.sh | tee ci/coverage.txt
+          } 2>&1 | tee ci/checks.log
+          {
+            echo "== exemplos visuais"
+            mkdir -p ci/exemplo
+            SAMPLE_OUT=$PWD/ci/exemplo flutter test test/sample_preview_test.dart --update-goldens \
+              && cp test/goldens/*.png ci/exemplo/ \
+              && (cd ci/exemplo && for f in *.pdf; do pdftoppm -png -r 75 "$f" "${f%.pdf}"; done; ls -la)
+          } 2>&1 | tee -a ci/checks.log || true
+          flutter build apk --release --dart-define=FUNILAR_VERSION=v1.0.${{ github.run_number }} 2>&1 | tee ci/android.log || status=1
+          flutter build linux --release --dart-define=FUNILAR_VERSION=v1.0.${{ github.run_number }} 2>&1 | tee ci/linux.log || status=$((status+2))
+          echo "$status" > ci/android-linux.status
+          if [ -f build/app/outputs/flutter-apk/app-release.apk ]; then
+            mkdir -p out && cp build/app/outputs/flutter-apk/app-release.apk out/${APP_ASSET}-android.apk
+          fi
+          if [ -d build/linux/x64/release/bundle ]; then
+            mkdir -p out && tar -C build/linux/x64/release -czf out/${APP_ASSET}-linux-x64.tar.gz bundle
+          fi
+          exit $status
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: logs-android-linux
+          path: ci/
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: out-android-linux
+          path: out/
+          if-no-files-found: ignore
+
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Nome do sistema
+        shell: bash
+        run: cat tool/app.env >> "$GITHUB_ENV"
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+      - name: Build
+        shell: bash
+        run: |
+          set -o pipefail
+          mkdir -p ci
+          status=0
+          { bash tool/prepare_platforms.sh && flutter pub get; } 2>&1 | tee ci/windows-prep.log || status=1
+          flutter build windows --release --dart-define=FUNILAR_VERSION=v1.0.${{ github.run_number }} 2>&1 | tee ci/windows.log || status=1
+          echo "$status" > ci/windows.status
+          if [ -d build/windows/x64/runner/Release ]; then
+            mkdir -p out
+            powershell -Command "Compress-Archive -Path build/windows/x64/runner/Release/* -DestinationPath out/${APP_ASSET}-windows-x64.zip"
+            echo "== teste do atualizador (Windows real)" > ci/updater-test.log
+            FUNILAR_ZIP="$(pwd -W)/out/${APP_ASSET}-windows-x64.zip" flutter test test/updater_windows_test.dart -r expanded >> ci/updater-test.log 2>&1 && echo UPDATER_OK >> ci/updater-test.log || echo UPDATER_FAILED >> ci/updater-test.log
+          fi
+          exit $status
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: logs-windows
+          path: ci/
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: out-windows
+          path: out/
+          if-no-files-found: ignore
+
+  ios:
+    # Mac no GitHub gasta 10x mais minutos em repositório privado:
+    # roda só quando pedido (botão "Run workflow" ou "[ios]" na mensagem do commit).
+    if: github.event_name == 'workflow_dispatch' || contains(github.event.head_commit.message, '[ios]')
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Nome do sistema
+        shell: bash
+        run: cat tool/app.env >> "$GITHUB_ENV"
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+      - name: Build
+        shell: bash
+        run: |
+          set -o pipefail
+          mkdir -p ci out
+          status=0
+          {
+            bash tool/prepare_platforms.sh && flutter pub get \
+              && flutter build ios --config-only --no-codesign \
+              && bash tool/prepare_platforms.sh && grep -n "platform :ios" ios/Podfile
+          } 2>&1 | tee ci/ios-prep.log || status=1
+          flutter build ios --release --no-codesign --dart-define=FUNILAR_VERSION=v1.0.${{ github.run_number }} 2>&1 | tee ci/ios.log || status=1
+          if [ -d build/ios/iphoneos/Runner.app ]; then
+            mkdir -p ipa/Payload
+            cp -R build/ios/iphoneos/Runner.app ipa/Payload/
+            (cd ipa && zip -qry ../out/${APP_ASSET}-ios-sem-assinatura.ipa Payload)
+          else
+            status=1
+          fi
+          echo "$status" > ci/ios.status
+          exit $status
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: logs-ios
+          path: ci/
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: out-ios
+          path: out/
+          if-no-files-found: ignore
+
+  report:
+    needs: [android-linux, windows, ios]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Nome do sistema
+        shell: bash
+        run: cat tool/app.env >> "$GITHUB_ENV"
+      - uses: actions/download-artifact@v4
+        with:
+          path: dl
+      - name: Criar release
+        if: needs.android-linux.result == 'success' && needs.windows.result == 'success'
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          mkdir -p /tmp/logs
+          tag="v1.0.${GITHUB_RUN_NUMBER}"
+          ls -laR dl > /tmp/logs/release.log 2>&1
+          gh release create "$tag" dl/out-*/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --title "$APP_TITLE $tag" \
+            --notes "Android: instale o ${APP_ASSET}-android.apk. Windows: extraia o .zip e abra ${APP_PACKAGE}.exe. Linux: extraia o .tar.gz e rode bundle/${APP_PACKAGE}. iPhone (quando presente): instale o .ipa com Sideloadly ou AltStore usando seu Apple ID." \
+            >> /tmp/logs/release.log 2>&1 && echo RELEASE_OK >> /tmp/logs/release.log || echo RELEASE_FAILED >> /tmp/logs/release.log
+      - name: Publicar logs no branch ci-logs
+        shell: bash
+        run: |
+          mkdir -p /tmp/logs
+          cp -r dl/logs-* /tmp/logs/ 2>/dev/null || true
+          {
+            echo "commit: ${GITHUB_SHA}"
+            echo "run: ${GITHUB_RUN_NUMBER}"
+            echo "android-linux: ${{ needs.android-linux.result }}"
+            echo "windows: ${{ needs.windows.result }}"
+            echo "ios: ${{ needs.ios.result }}"
+          } > /tmp/logs/SUMMARY.txt
+          git config user.name "ci"
+          git config user.email "ci@users.noreply.github.com"
+          git checkout --orphan ci-logs
+          git rm -rf . >/dev/null
+          rm -rf ./* .github 2>/dev/null || true
+          cp -r /tmp/logs/* .
+          git add -A
+          git commit -m "logs ${GITHUB_RUN_NUMBER} ${GITHUB_SHA}" >/dev/null
+          git push -f origin ci-logs
